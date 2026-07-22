@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict
+import json
 from pathlib import Path
 import re
 
@@ -24,10 +25,10 @@ from torchvision.models import resnet50
 
 try:
     from .probe_common import RunningVectorStats, read_pairs, save_probe_results
-    from .distributed_utils import cleanup_distributed, init_distributed, is_distributed, is_main_process
+    from .distributed_utils import audit_pair_coverage, cleanup_distributed, init_distributed, is_distributed, is_main_process
 except ImportError:  # allows direct execution from UniCaCLF/
     from probe_common import RunningVectorStats, read_pairs, save_probe_results
-    from distributed_utils import cleanup_distributed, init_distributed, is_distributed, is_main_process
+    from distributed_utils import audit_pair_coverage, cleanup_distributed, init_distributed, is_distributed, is_main_process
 
 
 RGB_MEAN = torch.tensor([123.675, 116.28, 103.53]).view(1, 3, 1, 1)
@@ -195,19 +196,22 @@ def flow_input(
     return (value - FLOW_MEAN) / FLOW_STD
 
 
-def accumulate_stream(model, captured, real: torch.Tensor, fake: torch.Tensor, stats, device, amp: bool) -> None:
+def collect_stream_deltas(model, captured, real: torch.Tensor, fake: torch.Tensor, device, amp: bool) -> dict[str, np.ndarray]:
+    """Return all layer deltas before changing any accumulator."""
     length = real.shape[0]
     batch = torch.cat((real, fake), dim=0).to(device, non_blocking=True)
     for key in captured:
         captured[key] = None
     with torch.inference_mode(), torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp and device.type == "cuda"):
         _ = model(batch)
+    deltas = {}
     for name, activation in captured.items():
         if activation is None:
             raise RuntimeError(f"TSN hook did not capture {name}")
         # [2*N,C,H,W] -> [2,N,C] -> one paired vector [C].
         pooled = activation.float().mean(dim=(2, 3)).reshape(2, length, -1).mean(dim=1).cpu().numpy()
-        stats[name].update(pooled[1] - pooled[0])
+        deltas[name] = pooled[1] - pooled[0]
+    return deltas
 
 
 def gather_stats(stats: dict[str, RunningVectorStats]) -> dict[str, RunningVectorStats] | None:
@@ -238,9 +242,10 @@ def main() -> None:
     parser.add_argument("--flow-bound", type=float, default=20.0)
     parser.add_argument("--top-ratio", type=float, default=0.10)
     parser.add_argument(
-        "--max-pairs", type=int, default=100,
-        help="Number of strict pairs to probe (default: 100; use 0 for every pair in the manifest)",
+        "--max-pairs", type=int, default=0,
+        help="Number of strict pairs to probe (default: 0 means every pair in the manifest)",
     )
+    parser.add_argument("--decode-threads", type=int, default=1, help="Decord threads per GPU process")
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
@@ -251,29 +256,43 @@ def main() -> None:
     flow_model = build_tsn(args.flow_checkpoint, "Flow", device)
     rgb_hidden, rgb_handles = register_bottleneck_hooks(rgb_model, "rgb")
     flow_hidden, flow_handles = register_bottleneck_hooks(flow_model, "flow")
-    stats: Dict[str, RunningVectorStats] = {}
+    if args.decode_threads < 1: parser.error("--decode-threads must be positive")
+    stats: dict[str, RunningVectorStats] = {}
     # Initialising widths from a single module is safer than hard-coding ResNet stage dimensions.
     for model, prefix in ((rgb_model, "rgb"), (flow_model, "flow")):
         for stage in range(1, 5):
             for block_index, block in enumerate(getattr(model.backbone, f"layer{stage}"), 1):
                 stats[f"{prefix}_res{stage + 1}_b{block_index}"] = RunningVectorStats(block.conv3.out_channels)
-    pairs = read_pairs(args.pairs, "video")
-    if args.max_pairs > 0: pairs = pairs[:args.max_pairs]
-    pairs = pairs[rank::world_size]
+    selected_pairs = read_pairs(args.pairs, "video")
+    if args.max_pairs > 0: selected_pairs = selected_pairs[:args.max_pairs]
+    expected_ids = [pair.pair_id for pair in selected_pairs]
+    pairs = selected_pairs[rank::world_size]
     failures = []
+    attempted_ids, success_ids, failed_ids = [], [], []
     try:
         for pair in tqdm(pairs, desc="TSN paired neuron probe", disable=not is_main_process()):
+            attempted_ids.append(pair.pair_id)
             try:
                 times = sampled_times(pair.start_sec, pair.end_sec, args.samples_per_period)
-                accumulate_stream(rgb_model, rgb_hidden, rgb_input(pair.original_file, times, args.image_size), rgb_input(pair.fake_file, times, args.image_size), stats, device, args.amp)
-                accumulate_stream(
-                    flow_model, flow_hidden,
-                    flow_input(pair.original_file, times, args.image_size, args.flow_method, args.flow_bound, pair.start_sec, pair.end_sec),
-                    flow_input(pair.fake_file, times, args.image_size, args.flow_method, args.flow_bound, pair.start_sec, pair.end_sec),
-                    stats, device, args.amp,
+                deltas = collect_stream_deltas(
+                    rgb_model, rgb_hidden,
+                    rgb_input(pair.original_file, times, args.image_size, args.decode_threads),
+                    rgb_input(pair.fake_file, times, args.image_size, args.decode_threads),
+                    device, args.amp,
                 )
+                deltas.update(collect_stream_deltas(
+                    flow_model, flow_hidden,
+                    flow_input(pair.original_file, times, args.image_size, args.flow_method, args.flow_bound, pair.start_sec, pair.end_sec, args.decode_threads),
+                    flow_input(pair.fake_file, times, args.image_size, args.flow_method, args.flow_bound, pair.start_sec, pair.end_sec, args.decode_threads),
+                    device, args.amp,
+                ))
+                # The two streams are an atomic pair: a Flow failure cannot
+                # leave RGB layers with an extra observation.
+                for name, value in deltas.items(): stats[name].update(value)
+                success_ids.append(pair.pair_id)
             except Exception as error:
                 failures.append(f"{pair.pair_id}: {type(error).__name__}: {error}")
+                failed_ids.append(pair.pair_id)
     finally:
         for handle in rgb_handles + flow_handles: handle.remove()
     merged = gather_stats(stats)
@@ -281,12 +300,19 @@ def main() -> None:
         gathered_failures = [None] * dist.get_world_size()
         dist.all_gather_object(gathered_failures, failures)
         failures = [value for part in gathered_failures for value in part]
+    audit = audit_pair_coverage(expected_ids, attempted_ids, success_ids, failed_ids)
     if is_main_process():
-        save_probe_results(args.output_dir, "tsn", merged, args.top_ratio)
+        if audit["successful_pairs"]:
+            counts = {state.count for state in merged.values()}
+            if counts != {audit["successful_pairs"]}:
+                raise RuntimeError(f"Non-atomic TSN statistics: layer counts={counts}, audit={audit}")
+            save_probe_results(args.output_dir, "tsn", merged, args.top_ratio)
         if failures:
+            args.output_dir.mkdir(parents=True, exist_ok=True)
             (args.output_dir / "tsn_failures.txt").write_text("\n".join(failures) + "\n", encoding="utf-8")
-        processed = next(iter(merged.values())).count
-        print(f"Processed {processed}/{processed + len(failures)} pairs. Results: {args.output_dir}")
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        (args.output_dir / "tsn_run_audit.json").write_text(json.dumps(audit, indent=2), encoding="utf-8")
+        print(f"Processed {audit['successful_pairs']}/{audit['expected_pairs']} pairs. Results: {args.output_dir}")
     cleanup_distributed()
 
 

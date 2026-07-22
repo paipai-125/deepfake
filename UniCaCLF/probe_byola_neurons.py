@@ -18,10 +18,10 @@ from tqdm import tqdm
 
 try:
     from .probe_common import RunningVectorStats, read_pairs, save_probe_results
-    from .distributed_utils import cleanup_distributed, init_distributed, is_distributed, is_main_process
+    from .distributed_utils import audit_pair_coverage, cleanup_distributed, init_distributed, is_distributed, is_main_process
 except ImportError:
     from probe_common import RunningVectorStats, read_pairs, save_probe_results
-    from distributed_utils import cleanup_distributed, init_distributed, is_distributed, is_main_process
+    from distributed_utils import audit_pair_coverage, cleanup_distributed, init_distributed, is_distributed, is_main_process
 
 
 def load_stats(path: Path) -> tuple[float, float]:
@@ -95,10 +95,12 @@ def logmel_pair(real: torch.Tensor, fake: torch.Tensor, transform, mean: float, 
     return ((value - mean) / std).unsqueeze(1)
 
 
-def accumulate(model, captured, pair_input, stats, device, amp):
+def collect_deltas(model, captured, pair_input, device, amp) -> dict[str, np.ndarray]:
+    """Return all layer deltas before mutating any Welford accumulator."""
     for key in captured: captured[key] = None
     with torch.inference_mode(), torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp and device.type == "cuda"):
         _ = model(pair_input)
+    deltas = {}
     for name, activation in captured.items():
         if activation is None: raise RuntimeError(f"BYOL-A hook did not capture {name}")
         if name.startswith("audio_conv"):
@@ -107,7 +109,8 @@ def accumulate(model, captured, pair_input, stats, device, amp):
         else:
             # [2,T,D] -> [2,D]
             pooled = activation.float().mean(dim=1).cpu().numpy()
-        stats[name].update(pooled[1] - pooled[0])
+        deltas[name] = pooled[1] - pooled[0]
+    return deltas
 
 
 def gather_stats(stats: dict[str, RunningVectorStats]) -> dict[str, RunningVectorStats] | None:
@@ -142,8 +145,8 @@ def main() -> None:
     parser.add_argument("--f-max", type=float, default=7800)
     parser.add_argument("--top-ratio", type=float, default=0.10)
     parser.add_argument(
-        "--max-pairs", type=int, default=100,
-        help="Number of strict pairs to probe (default: 100; use 0 for every pair in the manifest)",
+        "--max-pairs", type=int, default=0,
+        help="Number of strict pairs to probe (default: 0 means every pair in the manifest)",
     )
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--device", default="cuda")
@@ -156,18 +159,26 @@ def main() -> None:
     model = load_byola(args.byola_repo, args.checkpoint, device, args.feature_dim)
     captured, handles = register_hooks(model)
     stats = {name: RunningVectorStats(64 if name.startswith("audio_conv") else args.feature_dim) for name in captured}
-    pairs = read_pairs(args.pairs, "audio")
-    if args.max_pairs > 0: pairs = pairs[:args.max_pairs]
-    pairs = pairs[rank::world_size]
+    selected_pairs = read_pairs(args.pairs, "audio")
+    if args.max_pairs > 0: selected_pairs = selected_pairs[:args.max_pairs]
+    expected_ids = [pair.pair_id for pair in selected_pairs]
+    pairs = selected_pairs[rank::world_size]
     failures = []
+    attempted_ids, success_ids, failed_ids = [], [], []
     try:
         for pair in tqdm(pairs, desc="BYOL-A paired neuron probe", disable=not is_main_process()):
+            attempted_ids.append(pair.pair_id)
             try:
                 real = decode_audio(pair.original_file, pair.start_sec, pair.end_sec, args.sample_rate)
                 fake = decode_audio(pair.fake_file, pair.start_sec, pair.end_sec, args.sample_rate)
-                accumulate(model, captured, logmel_pair(real, fake, transform, mean, std, device), stats, device, args.amp)
+                deltas = collect_deltas(model, captured, logmel_pair(real, fake, transform, mean, std, device), device, args.amp)
+                # Commit only after every layer has successfully produced its
+                # delta, keeping all layer counts identical.
+                for name, value in deltas.items(): stats[name].update(value)
+                success_ids.append(pair.pair_id)
             except Exception as error:
                 failures.append(f"{pair.pair_id}: {type(error).__name__}: {error}")
+                failed_ids.append(pair.pair_id)
     finally:
         for handle in handles: handle.remove()
     merged = gather_stats(stats)
@@ -175,12 +186,19 @@ def main() -> None:
         gathered_failures = [None] * dist.get_world_size()
         dist.all_gather_object(gathered_failures, failures)
         failures = [value for part in gathered_failures for value in part]
+    audit = audit_pair_coverage(expected_ids, attempted_ids, success_ids, failed_ids)
     if is_main_process():
-        save_probe_results(args.output_dir, "byola", merged, args.top_ratio)
+        if audit["successful_pairs"]:
+            counts = {state.count for state in merged.values()}
+            if counts != {audit["successful_pairs"]}:
+                raise RuntimeError(f"Non-atomic BYOL-A statistics: layer counts={counts}, audit={audit}")
+            save_probe_results(args.output_dir, "byola", merged, args.top_ratio)
         if failures:
+            args.output_dir.mkdir(parents=True, exist_ok=True)
             (args.output_dir / "byola_failures.txt").write_text("\n".join(failures) + "\n", encoding="utf-8")
-        processed = next(iter(merged.values())).count
-        print(f"Processed {processed}/{processed + len(failures)} pairs. Results: {args.output_dir}")
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        (args.output_dir / "byola_run_audit.json").write_text(json.dumps(audit, indent=2), encoding="utf-8")
+        print(f"Processed {audit['successful_pairs']}/{audit['expected_pairs']} pairs. Results: {args.output_dir}")
     cleanup_distributed()
 
 

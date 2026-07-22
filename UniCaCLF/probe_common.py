@@ -33,6 +33,15 @@ def read_pairs(path: Path, modality: str) -> list[ProbePair]:
         pairs.append(ProbePair(**value))
     if not pairs:
         raise ValueError(f"No {modality} pairs in {path}")
+    ids = [pair.pair_id for pair in pairs]
+    if len(ids) != len(set(ids)):
+        seen, duplicate_ids = set(), set()
+        for value in ids:
+            if value in seen:
+                duplicate_ids.add(value)
+            seen.add(value)
+        duplicates = sorted(duplicate_ids)
+        raise ValueError(f"Duplicate pair_id values in {path}: {duplicates[:8]}")
     return pairs
 
 
