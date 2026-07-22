@@ -1,0 +1,10 @@
+# Verified core environment on the server:
+# Python 3.10, PyTorch 2.6.0+cu124, torchvision 0.21.0+cu124,
+# torchaudio 2.6.0+cu124.
+# Install the three PyTorch packages through the matching CUDA wheel index,
+# then install this file.
+numpy
+matplotlib
+tqdm
+decord
+opencv-contrib-python
