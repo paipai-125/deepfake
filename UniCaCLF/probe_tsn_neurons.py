@@ -245,10 +245,6 @@ def main() -> None:
         "--max-pairs", type=int, default=0,
         help="Number of strict pairs to probe (default: 0 means every pair in the manifest)",
     )
-    parser.add_argument(
-        "--sample-seed", type=int, default=2026,
-        help="Fixed RNG seed used when --max-pairs selects a subset",
-    )
     parser.add_argument("--decode-threads", type=int, default=1, help="Decord threads per GPU process")
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--device", default="cuda")
@@ -268,62 +264,40 @@ def main() -> None:
             for block_index, block in enumerate(getattr(model.backbone, f"layer{stage}"), 1):
                 stats[f"{prefix}_res{stage + 1}_b{block_index}"] = RunningVectorStats(block.conv3.out_channels)
     selected_pairs = read_pairs(args.pairs, "video")
-    if args.max_pairs > 0 and len(selected_pairs) > args.max_pairs:
-        # Randomly select a reproducible global subset before rank sharding.
-        # Sorting restores manifest order while preserving the sampled membership.
-        generator = np.random.default_rng(args.sample_seed)
-        indices = np.sort(generator.choice(len(selected_pairs), size=args.max_pairs, replace=False))
-        selected_pairs = [selected_pairs[int(index)] for index in indices]
+    if args.max_pairs > 0: selected_pairs = selected_pairs[:args.max_pairs]
     expected_ids = [pair.pair_id for pair in selected_pairs]
     pairs = selected_pairs[rank::world_size]
-    failures = []
-    attempted_ids, success_ids, failed_ids = [], [], []
+    attempted_ids, success_ids = [], []
     try:
         for pair in tqdm(pairs, desc="TSN paired neuron probe", disable=not is_main_process()):
             attempted_ids.append(pair.pair_id)
-            try:
-                times = sampled_times(pair.start_sec, pair.end_sec, args.samples_per_period)
-                deltas = collect_stream_deltas(
-                    rgb_model, rgb_hidden,
-                    rgb_input(pair.original_file, times, args.image_size, args.decode_threads),
-                    rgb_input(pair.fake_file, times, args.image_size, args.decode_threads),
-                    device, args.amp,
-                )
-                deltas.update(collect_stream_deltas(
-                    flow_model, flow_hidden,
-                    flow_input(pair.original_file, times, args.image_size, args.flow_method, args.flow_bound, pair.start_sec, pair.end_sec, args.decode_threads),
-                    flow_input(pair.fake_file, times, args.image_size, args.flow_method, args.flow_bound, pair.start_sec, pair.end_sec, args.decode_threads),
-                    device, args.amp,
-                ))
-                # The two streams are an atomic pair: a Flow failure cannot
-                # leave RGB layers with an extra observation.
-                for name, value in deltas.items(): stats[name].update(value)
-                success_ids.append(pair.pair_id)
-            except Exception as error:
-                failures.append(f"{pair.pair_id}: {type(error).__name__}: {error}")
-                failed_ids.append(pair.pair_id)
+            times = sampled_times(pair.start_sec, pair.end_sec, args.samples_per_period)
+            deltas = collect_stream_deltas(
+                rgb_model, rgb_hidden,
+                rgb_input(pair.original_file, times, args.image_size, args.decode_threads),
+                rgb_input(pair.fake_file, times, args.image_size, args.decode_threads),
+                device, args.amp,
+            )
+            deltas.update(collect_stream_deltas(
+                flow_model, flow_hidden,
+                flow_input(pair.original_file, times, args.image_size, args.flow_method, args.flow_bound, pair.start_sec, pair.end_sec, args.decode_threads),
+                flow_input(pair.fake_file, times, args.image_size, args.flow_method, args.flow_bound, pair.start_sec, pair.end_sec, args.decode_threads),
+                device, args.amp,
+            ))
+            # The two streams are an atomic pair: a Flow failure cannot
+            # leave RGB layers with an extra observation.
+            for name, value in deltas.items(): stats[name].update(value)
+            success_ids.append(pair.pair_id)
     finally:
         for handle in rgb_handles + flow_handles: handle.remove()
     merged = gather_stats(stats)
-    if is_distributed():
-        gathered_failures = [None] * dist.get_world_size()
-        dist.all_gather_object(gathered_failures, failures)
-        failures = [value for part in gathered_failures for value in part]
-    audit = audit_pair_coverage(expected_ids, attempted_ids, success_ids, failed_ids)
+    audit = audit_pair_coverage(expected_ids, attempted_ids, success_ids, [])
     if is_main_process():
-        audit["sampling"] = {
-            "max_pairs": args.max_pairs,
-            "sample_seed": args.sample_seed if args.max_pairs > 0 else None,
-            "method": "fixed_rng_without_replacement" if args.max_pairs > 0 else "all_pairs",
-        }
         if audit["successful_pairs"]:
             counts = {state.count for state in merged.values()}
             if counts != {audit["successful_pairs"]}:
                 raise RuntimeError(f"Non-atomic TSN statistics: layer counts={counts}, audit={audit}")
             save_probe_results(args.output_dir, "tsn", merged, args.top_ratio)
-        if failures:
-            args.output_dir.mkdir(parents=True, exist_ok=True)
-            (args.output_dir / "tsn_failures.txt").write_text("\n".join(failures) + "\n", encoding="utf-8")
         args.output_dir.mkdir(parents=True, exist_ok=True)
         (args.output_dir / "tsn_run_audit.json").write_text(json.dumps(audit, indent=2), encoding="utf-8")
         print(f"Processed {audit['successful_pairs']}/{audit['expected_pairs']} pairs. Results: {args.output_dir}")
