@@ -148,6 +148,10 @@ def main() -> None:
         "--max-pairs", type=int, default=0,
         help="Number of strict pairs to probe (default: 0 means every pair in the manifest)",
     )
+    parser.add_argument(
+        "--sample-seed", type=int, default=2026,
+        help="Fixed RNG seed used when --max-pairs selects a subset",
+    )
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
@@ -160,7 +164,12 @@ def main() -> None:
     captured, handles = register_hooks(model)
     stats = {name: RunningVectorStats(64 if name.startswith("audio_conv") else args.feature_dim) for name in captured}
     selected_pairs = read_pairs(args.pairs, "audio")
-    if args.max_pairs > 0: selected_pairs = selected_pairs[:args.max_pairs]
+    if args.max_pairs > 0 and len(selected_pairs) > args.max_pairs:
+        # Randomly select a reproducible global subset before rank sharding.
+        # Sorting restores manifest order while preserving the sampled membership.
+        generator = np.random.default_rng(args.sample_seed)
+        indices = np.sort(generator.choice(len(selected_pairs), size=args.max_pairs, replace=False))
+        selected_pairs = [selected_pairs[int(index)] for index in indices]
     expected_ids = [pair.pair_id for pair in selected_pairs]
     pairs = selected_pairs[rank::world_size]
     failures = []
@@ -188,6 +197,11 @@ def main() -> None:
         failures = [value for part in gathered_failures for value in part]
     audit = audit_pair_coverage(expected_ids, attempted_ids, success_ids, failed_ids)
     if is_main_process():
+        audit["sampling"] = {
+            "max_pairs": args.max_pairs,
+            "sample_seed": args.sample_seed if args.max_pairs > 0 else None,
+            "method": "fixed_rng_without_replacement" if args.max_pairs > 0 else "all_pairs",
+        }
         if audit["successful_pairs"]:
             counts = {state.count for state in merged.values()}
             if counts != {audit["successful_pairs"]}:

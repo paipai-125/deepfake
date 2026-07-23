@@ -1,6 +1,7 @@
 import math
 import sys
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 
@@ -362,6 +363,14 @@ class Contextformer(nn.Module):
         # will throw an error if parameters are on different devices
         return list(set(p.device for p in self.parameters()))[0]
 
+    def synchronized_positive_count(self, local_count: int) -> float:
+        """Return the mean positive count per rank for DDP-consistent losses."""
+        count = torch.tensor(float(local_count), device=self.device)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(count, op=dist.ReduceOp.SUM)
+            count /= dist.get_world_size()
+        return max(float(count.item()), 1.0)
+
     def forward(self, video_list):
         # batch the video list into feats (B, C, T) and masks (B, 1, T)
         batched_inputs, batched_masks = self.preprocessing(video_list)
@@ -622,9 +631,12 @@ class Contextformer(nn.Module):
 
         # update the loss normalizer
         num_pos = pos_mask.sum().item()
+        # DDP averages gradients across ranks.  Use the mean positive count
+        # per rank so every replica applies the same loss normalization.
+        normalizer_count = self.synchronized_positive_count(num_pos)
         self.loss_normalizer = self.loss_normalizer_momentum * self.loss_normalizer + (
             1 - self.loss_normalizer_momentum
-        ) * max(num_pos, 1)
+        ) * normalizer_count
 
         # gt_cls is already one hot encoded now, simply masking out
         gt_target = gt_cls[valid_mask]
@@ -688,9 +700,12 @@ class Contextformer(nn.Module):
 
         # update the loss normalizer
         num_pos = pos_mask.sum().item()
+        # DDP averages gradients across ranks.  Use the mean positive count
+        # per rank so every replica applies the same loss normalization.
+        normalizer_count = self.synchronized_positive_count(num_pos)
         self.loss_normalizer = self.loss_normalizer_momentum * self.loss_normalizer + (
             1 - self.loss_normalizer_momentum
-        ) * max(num_pos, 1)
+        ) * normalizer_count
 
         # gt_cls is already one hot encoded now, simply masking out
         gt_target = gt_cls[valid_mask]
