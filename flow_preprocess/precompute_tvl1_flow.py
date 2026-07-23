@@ -54,8 +54,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-dtype", choices=("float16", "float32"), default="float16")
     parser.add_argument("--max-items", type=int, default=None,
                         help="Debug limit per split, applied globally before rank sharding")
+    parser.add_argument("--shard-count", type=int, default=1,
+                        help="Split each selected split into this many outer data shards")
+    parser.add_argument("--shard-index", type=int, default=0,
+                        help="0-based outer data shard index to run before rank/batch sharding")
+    parser.add_argument("--batch-count", type=int, default=1,
+                        help="Split each rank-local shard into this many contiguous record batches")
+    parser.add_argument("--batch-index", type=int, default=0,
+                        help="0-based rank-local batch index to precompute")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
+
+
+def select_contiguous_batch(records: list[dict], batch_count: int, batch_index: int) -> list[dict]:
+    """Select one deterministic contiguous batch after split/max-items filtering."""
+    if batch_count == 1:
+        return records
+    start = len(records) * batch_index // batch_count
+    end = len(records) * (batch_index + 1) // batch_count
+    return records[start:end]
 
 
 def rank_and_world_size() -> tuple[int, int]:
@@ -102,6 +119,10 @@ def main() -> None:
     args = parse_args()
     if args.video_stride_frames < 1 or args.image_size < 1 or args.chunk_size < 1 or args.decode_threads < 1:
         raise ValueError("--video-stride-frames, --image-size, --chunk-size and --decode-threads must be positive")
+    if args.shard_count < 1 or not 0 <= args.shard_index < args.shard_count:
+        raise ValueError("--shard-count must be positive and --shard-index must satisfy 0 <= index < count")
+    if args.batch_count < 1 or not 0 <= args.batch_index < args.batch_count:
+        raise ValueError("--batch-count must be positive and --batch-index must satisfy 0 <= index < count")
     rank, world_size = rank_and_world_size()
     records = json.loads(args.subset.read_text(encoding="utf-8"))
     settings = {
@@ -113,6 +134,11 @@ def main() -> None:
         "stored_value": "(resize_crop(encoded_tvl1_flow) - 128) / 128",
         "cache_dtype": args.cache_dtype,
         "world_size": world_size,
+        "shard_count": args.shard_count,
+        "shard_index": args.shard_index,
+        "batch_count": args.batch_count,
+        "batch_index": args.batch_index,
+        "batch_applied_after_rank_shard": True,
     }
     if rank == 0:
         args.output_root.mkdir(parents=True, exist_ok=True)
@@ -123,7 +149,12 @@ def main() -> None:
         split_records = [item for item in records if item.get("split") == split]
         if args.max_items is not None:
             split_records = split_records[:args.max_items]
-        for item in tqdm(split_records[rank::world_size], desc=f"TV-L1 cache {split} rank {rank}", disable=rank != 0):
+        split_records = select_contiguous_batch(split_records, args.shard_count, args.shard_index)
+        split_records = split_records[rank::world_size]
+        split_records = select_contiguous_batch(split_records, args.batch_count, args.batch_index)
+        shard_label = "" if args.shard_count == 1 else f" shard {args.shard_index + 1}/{args.shard_count}"
+        batch_label = "" if args.batch_count == 1 else f" batch {args.batch_index + 1}/{args.batch_count}"
+        for item in tqdm(split_records, desc=f"TV-L1 cache {split}{shard_label}{batch_label} rank {rank}", disable=rank != 0):
             source = args.lavdf_root / item["file"]
             times, _ = video_grid(source, args.video_stride_frames, args.decode_threads)
             # Use <output-root>/<metadata split>/<video id>.npy, rather than
@@ -148,7 +179,9 @@ def main() -> None:
                 del cache
                 temporary.replace(output)
             processed += 1
-    print(f"rank {rank}/{world_size}: cached {processed} videos under {args.output_root}")
+    shard_label = "" if args.shard_count == 1 else f" shard {args.shard_index + 1}/{args.shard_count}"
+    batch_label = "" if args.batch_count == 1 else f" batch {args.batch_index + 1}/{args.batch_count}"
+    print(f"rank {rank}/{world_size}: cached {processed} videos{shard_label}{batch_label} under {args.output_root}")
 
 
 if __name__ == "__main__":

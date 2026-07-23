@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -22,22 +23,84 @@ import numpy as np
 import torch
 
 
-def parse_cache_arg() -> Path:
-    """Consume only this wrapper's argument; leave all UniCaCLF arguments intact."""
+class InMemorySubset:
+    """Path-like subset object that keeps core settings pointing at the source JSON."""
+
+    def __init__(self, source: Path, records: list[dict]):
+        self.source = source
+        self.payload = json.dumps(records)
+
+    def read_text(self, encoding: str = "utf-8") -> str:
+        return self.payload
+
+    def __str__(self) -> str:
+        return str(self.source)
+
+
+def select_contiguous_batch(records: list, batch_count: int, batch_index: int) -> list:
+    if batch_count == 1:
+        return records
+    start = len(records) * batch_index // batch_count
+    end = len(records) * (batch_index + 1) // batch_count
+    return records[start:end]
+
+
+def parse_wrapper_args() -> argparse.Namespace:
+    """Consume this wrapper's arguments; leave all UniCaCLF arguments intact."""
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--flow-cache-root", type=Path)
+    parser.add_argument("--shard-count", type=int, default=1,
+                        help="Optional outer data shard count before rank sharding")
+    parser.add_argument("--shard-index", type=int, default=0,
+                        help="0-based outer data shard index before rank sharding")
+    parser.add_argument("--batch-count", type=int, default=1,
+                        help="Split each rank-local shard into this many batches")
+    parser.add_argument("--batch-index", type=int, default=0,
+                        help="0-based batch index inside each rank-local shard")
     wrapper_args, remaining = parser.parse_known_args()
     if wrapper_args.flow_cache_root is None:
         if "-h" in remaining or "--help" in remaining:
-            print("Additional cache wrapper argument:\n  --flow-cache-root FLOW_CACHE_ROOT")
-            # Let the unchanged UniCaCLF parser print all of its own options.
+            print(
+                "Additional cache wrapper arguments:\n"
+                "  --flow-cache-root FLOW_CACHE_ROOT\n"
+                "  --batch-count BATCH_COUNT\n"
+                "  --batch-index BATCH_INDEX\n"
+                "  --shard-count SHARD_COUNT\n"
+                "  --shard-index SHARD_INDEX"
+            )
             sys.argv = [sys.argv[0], "--help"]
             import UniCaCLF.extract_unicaclf_offline_features as core
             core.main()
         parser.error("--flow-cache-root is required")
+    if wrapper_args.shard_count < 1 or not 0 <= wrapper_args.shard_index < wrapper_args.shard_count:
+        parser.error("--shard-count must be positive and --shard-index must satisfy 0 <= index < count")
+    if wrapper_args.batch_count < 1 or not 0 <= wrapper_args.batch_index < wrapper_args.batch_count:
+        parser.error("--batch-count must be positive and --batch-index must satisfy 0 <= index < count")
     sys.argv = [sys.argv[0], *remaining]
-    return wrapper_args.flow_cache_root
+    return wrapper_args
 
+
+def apply_wrapper_subset_filter(core_args, wrapper_args: argparse.Namespace) -> None:
+    """Match precompute_tvl1_flow's shard -> rank -> batch record selection."""
+    if wrapper_args.shard_count == 1 and wrapper_args.batch_count == 1:
+        return
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    records = json.loads(core_args.subset.read_text(encoding="utf-8"))
+    selected: list[dict] = []
+    for split in core_args.splits:
+        split_records = [item for item in records if item.get("split") == split]
+        if core_args.max_items is not None:
+            split_records = split_records[:core_args.max_items]
+        split_records = select_contiguous_batch(split_records, wrapper_args.shard_count, wrapper_args.shard_index)
+        selected_positions: list[int] = []
+        for rank in range(world_size):
+            rank_positions = list(range(rank, len(split_records), world_size))
+            selected_positions.extend(
+                select_contiguous_batch(rank_positions, wrapper_args.batch_count, wrapper_args.batch_index)
+            )
+        selected.extend(split_records[index] for index in sorted(selected_positions))
+    core_args.subset = InMemorySubset(core_args.subset, selected)
+    core_args.max_items = None
 
 def validate_cache(root: Path, *, stride: int, image_size: int, flow_bound: float) -> None:
     settings_path = root / "flow_cache_settings.json"
@@ -97,7 +160,8 @@ def cached_flow_input(cache_root: Path):
 
 def main() -> None:
     global core_args
-    cache_root = parse_cache_arg()
+    wrapper_args = parse_wrapper_args()
+    cache_root = wrapper_args.flow_cache_root
     import UniCaCLF.extract_unicaclf_offline_features as core
 
     # Parse the original extractor's complete command line once, validate the
@@ -105,6 +169,7 @@ def main() -> None:
     # would parse a second time, so invoke its main body through this small
     # argument-preserving wrapper instead.
     core_args = core.parse_args()
+    apply_wrapper_subset_filter(core_args, wrapper_args)
     validate_cache(cache_root, stride=core_args.video_stride_frames,
                    image_size=core_args.image_size, flow_bound=core_args.flow_bound)
     core.flow_input = cached_flow_input(cache_root)
