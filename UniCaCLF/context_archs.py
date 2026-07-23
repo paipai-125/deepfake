@@ -354,8 +354,10 @@ class Contextformer(nn.Module):
 
         # maintain an EMA of #foreground to stabilize the loss normalizer
         # useful for small mini-batch training
-        self.loss_normalizer = 200
-        self. loss_normalizer_momentum = 0.9
+        # Persist this EMA in checkpoints so resumed training keeps the
+        # same loss scale rather than restarting from the initial value.
+        self.register_buffer("loss_normalizer", torch.tensor(200.0))
+        self.loss_normalizer_momentum = 0.9
 
     @property
     def device(self):
@@ -634,9 +636,10 @@ class Contextformer(nn.Module):
         # DDP averages gradients across ranks.  Use the mean positive count
         # per rank so every replica applies the same loss normalization.
         normalizer_count = self.synchronized_positive_count(num_pos)
-        self.loss_normalizer = self.loss_normalizer_momentum * self.loss_normalizer + (
-            1 - self.loss_normalizer_momentum
-        ) * normalizer_count
+        with torch.no_grad():
+            self.loss_normalizer.mul_(self.loss_normalizer_momentum).add_(
+                (1 - self.loss_normalizer_momentum) * normalizer_count
+            )
 
         # gt_cls is already one hot encoded now, simply masking out
         gt_target = gt_cls[valid_mask]
@@ -703,9 +706,10 @@ class Contextformer(nn.Module):
         # DDP averages gradients across ranks.  Use the mean positive count
         # per rank so every replica applies the same loss normalization.
         normalizer_count = self.synchronized_positive_count(num_pos)
-        self.loss_normalizer = self.loss_normalizer_momentum * self.loss_normalizer + (
-            1 - self.loss_normalizer_momentum
-        ) * normalizer_count
+        with torch.no_grad():
+            self.loss_normalizer.mul_(self.loss_normalizer_momentum).add_(
+                (1 - self.loss_normalizer_momentum) * normalizer_count
+            )
 
         # gt_cls is already one hot encoded now, simply masking out
         gt_target = gt_cls[valid_mask]

@@ -284,7 +284,12 @@ def main():
     payload = None
     if args.checkpoint:
         payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-        model.load_state_dict(payload["model"] if "model" in payload else payload, strict=True)
+        checkpoint_state = payload["model"] if "model" in payload else payload
+        # Pre-buffer checkpoints remain resumable; new checkpoints restore the
+        # saved EMA exactly through the model state dict.
+        checkpoint_state = dict(checkpoint_state)
+        checkpoint_state.setdefault("loss_normalizer", model.loss_normalizer.detach().clone())
+        model.load_state_dict(checkpoint_state, strict=True)
     if distributed_enabled():
         # Some full-truth minibatches bypass contrastive-loss branches.
         # Detecting unused parameters makes DDP robust to that valid case.
