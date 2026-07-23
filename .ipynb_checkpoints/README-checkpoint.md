@@ -1,60 +1,41 @@
 # UniCaCLF 实验交接说明
 
-交接时，接收者先创建自己的 `deepfake/` 根目录，再将本交接包中的 `deepfake-code/` 直接放入该根目录。
-
-```text
-deepfake/
-├── deepfake-code/                 # 可运行源码
-│   ├── UniCaCLF/                  # UniCaCLF、特征提取、训练与神经元探测代码
-│   ├── byol-a/                    # BYOL-A 源码
-│   ├── requirements.txt
-│   └── README.md
-└── deepfake-data/                 # 接收者自行下载或运行生成，初始为空
-    ├── LAV-DF/                    # 下载的数据集
-    ├── models/tsn/                # 下载的 TSN RGB / Flow 权重
-    ├── models/byola/              # 下载的 BYOL-A 权重
-    ├── manifests/                 # 运行脚本生成
-    ├── cache/                     # 离线特征提取生成
-    └── results/                   # 探测、训练、测试生成
-
-```
+所有代码均在 `deepfake-code/` 目录下执行。
 
 ## 1. 环境
 
-以下在 `deepfake/` 根目录执行。已验证组合为 Python 3.10、PyTorch 2.6.0 CUDA 12.4、torchvision/torchaudio 2.6.0 和 RTX 4090。
+组合为 Python 3.10、PyTorch 2.6.0 CUDA 12.4、torchvision/torchaudio 2.6.0 和 RTX 4090。
 
 ```bash
 conda create -n deepfake python=3.10 -y
 conda activate deepfake
 
 pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
-pip install -r deepfake-code/requirements.txt
+pip install -r requirements.txt
 conda install -c conda-forge ffmpeg -y
-
-export PYTHONPATH="$PWD/deepfake-code:${PYTHONPATH}"
 ```
 
 ## 2. 数据集与模型下载
 
 ### LAV-DF
 
-将官方 LAV-DF 数据集完整下载到 `deepfake-data/LAV-DF/`，必须保留官方目录
+将官方 LAV-DF 数据集完整下载到 `../deepfake-data/LAV-DF/`，必须保留官方目录
 
 ```bash
 pip install -U huggingface_hub
 
 export HF_ENDPOINT=https://hf-mirror.com
-hf download ControlNet/LAV-DF --repo-type dataset --local-dir deepfake-data/LAV-DF
+hf download ControlNet/LAV-DF --repo-type dataset --local-dir ../deepfake-data/LAV-DF
 ```
 
 ### TSN 权重
 
 ```bash
-mkdir -p deepfake-data/models/tsn deepfake-data/models/byola
+mkdir -p ../deepfake-data/models/tsn ../deepfake-data/models/byola
 
-wget -c -P deepfake-data/models/tsn https://download.openmmlab.com/mmaction/recognition/tsn/tsn_r50_320p_1x1x8_50e_activitynet_clip_rgb/tsn_r50_320p_1x1x8_50e_activitynet_clip_rgb_20210301-c0f04a7e.pth
+wget -c -P ../deepfake-data/models/tsn https://download.openmmlab.com/mmaction/recognition/tsn/tsn_r50_320p_1x1x8_50e_activitynet_clip_rgb/tsn_r50_320p_1x1x8_50e_activitynet_clip_rgb_20210301-c0f04a7e.pth
 
-wget -c -P deepfake-data/models/tsn https://download.openmmlab.com/mmaction/recognition/tsn/tsn_r50_320p_1x1x8_150e_activitynet_clip_flow/tsn_r50_320p_1x1x8_150e_activitynet_clip_flow_20200804-8622cf38.pth
+wget -c -P ../deepfake-data/models/tsn https://download.openmmlab.com/mmaction/recognition/tsn/tsn_r50_320p_1x1x8_150e_activitynet_clip_flow/tsn_r50_320p_1x1x8_150e_activitynet_clip_flow_20200804-8622cf38.pth
 ```
 
 ### BYOL-A 权重
@@ -62,7 +43,7 @@ wget -c -P deepfake-data/models/tsn https://download.openmmlab.com/mmaction/reco
 下载官方 BYOL-A 仓库中的预训练权重`AudioNTT2020-BYOLA-64x96d2048.pth`
 
 ```bash
-wget -c -O deepfake-data/models/byola/AudioNTT2020-BYOLA-64x96d2048.pth https://github.com/nttcslab/byol-a/raw/master/pretrained_weights/AudioNTT2020-BYOLA-64x96d2048.pth
+wget -c -O ../deepfake-data/models/byola/AudioNTT2020-BYOLA-64x96d2048.pth https://github.com/nttcslab/byol-a/raw/master/pretrained_weights/AudioNTT2020-BYOLA-64x96d2048.pth
 ```
 
 ## 3. 创建固定 12k/2k/4k 子集与探测 pair
@@ -70,9 +51,7 @@ wget -c -O deepfake-data/models/byola/AudioNTT2020-BYOLA-64x96d2048.pth https://
 `make_lavdf_subset.py`、`build_probe_pairs.py` 仅处理 JSON 元数据，不使用 GPU，保留单进程运行。
 
 ```bash
-mkdir -p deepfake-data/manifests deepfake-data/results
-
-cd deepfake-code
+mkdir -p ../deepfake-data/manifests ../deepfake-data/results
 
 # 创新18k数据子集
 python -m UniCaCLF.make_lavdf_subset \
@@ -160,8 +139,8 @@ torchrun --standalone --nproc_per_node=8 \
 输出路径为：
 
 ```text
-deepfake-data/cache/unicaclf_lavdf_18k/final/    # RGB 2048 + Flow 2048；BYOL-A 2048
-deepfake-data/cache/unicaclf_lavdf_18k/neurons/  # top-rho 内部神经元拼接表征
+../deepfake-data/cache/unicaclf_lavdf_18k/final/    # RGB 2048 + Flow 2048；BYOL-A 2048
+../deepfake-data/cache/unicaclf_lavdf_18k/neurons/  # top-rho 内部神经元拼接表征
 ```
 
 Neuron 表征处理为：TSN 空间平均 / BYOL-A Conv 频率平均 → top-rho 通道选择 → 线性插值到 TSN 时间轴 → 每通道时序 z-score → 层拼接。
@@ -193,7 +172,7 @@ torchrun --standalone --nproc_per_node=8 -m UniCaCLF.run_unicaclf_baseline \
 
 ### top-rho 神经元表征
 
-读取 `deepfake-data/cache/unicaclf_lavdf_18k/extraction_settings.json` 中的 `neuron_video_dim`、`neuron_audio_dim`
+读取 `../deepfake-data/cache/unicaclf_lavdf_18k/extraction_settings.json` 中的 `neuron_video_dim`、`neuron_audio_dim`
 
 ```bash
 python -c "import json; d=json.load(open('../deepfake-data/cache/unicaclf_lavdf_18k/extraction_settings.json')); print('neuron_video_dim =', d['neuron_video_dim']); print('neuron_audio_dim =', d['neuron_audio_dim'])"
